@@ -1,0 +1,626 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Carrom — 2 Players</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#100602;display:flex;flex-direction:column;justify-content:center;align-items:center;min-height:100vh;overflow:hidden;font-family:Arial,sans-serif}
+  canvas{display:block;cursor:crosshair}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+'use strict';
+
+// ── Canvas setup ──────────────────────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const WIN_W  = 900, WIN_H = 970;
+canvas.width  = WIN_W;
+canvas.height = WIN_H;
+
+// ── Board geometry ────────────────────────────────────────────────────────────
+const BSIZE = 700, BX = 100, BY = 95;
+const BL = BX, BT = BY, BR = BX+BSIZE, BB = BY+BSIZE;
+const BW = 20;
+const PL = BL+BW, PT = BT+BW, PR = BR-BW, PB = BB-BW;
+const CX = Math.floor((PL+PR)/2);
+const CY = Math.floor((PT+PB)/2);
+
+// Baselines (where striker is placed)
+const BLY1 = PB - 62;   // Player-1 (bottom)
+const BLY2 = PT + 62;   // Player-2 (top)
+const BLX1 = PL + 95;   // left bound
+const BLX2 = PR - 95;   // right bound
+
+// ── Physics ───────────────────────────────────────────────────────────────────
+const FRICTION = 0.983;
+const VSTOP    = 0.22;
+const MAX_DRAG = 145;
+const MAX_SPD  = 25;
+const PCR = 14;   // piece radius
+const STR = 20;   // striker radius
+const PKR = 32;   // pocket detection radius
+const POCKETS = [[PL,PT],[PR,PT],[PL,PB],[PR,PB]];
+
+// ── States ────────────────────────────────────────────────────────────────────
+const AIMING = 0, MOVING = 1, GAME_OVER = 2;
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+const hyp = (ax,ay,bx,by) => Math.hypot(bx-ax,by-ay);
+
+function lighten(hex, amt) {
+  const r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
+  return `rgb(${Math.min(255,r+amt)},${Math.min(255,g+amt)},${Math.min(255,b+amt)})`;
+}
+
+function rrect(ctx, x,y,w,h,r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,  x+w,y+h, r);
+  ctx.arcTo(x+w,y+h,x,  y+h, r);
+  ctx.arcTo(x,  y+h,x,  y,   r);
+  ctx.arcTo(x,  y,  x+w,y,   r);
+  ctx.closePath();
+}
+
+// ── Piece class ───────────────────────────────────────────────────────────────
+class Piece {
+  constructor(x, y, kind, owner=null) {
+    this.x = x; this.y = y;
+    this.vx = 0; this.vy = 0;
+    this.kind  = kind;    // 'white'|'black'|'red'|'striker'
+    this.owner = owner;   // 1 or 2 (striker only)
+    this.r     = kind === 'striker' ? STR : PCR;
+    this.alive = true;
+  }
+
+  get hex() {
+    switch(this.kind){
+      case 'white':   return '#f0ebe2';
+      case 'black':   return '#252018';
+      case 'red':     return '#d42b2b';
+      case 'striker': return this.owner===1 ? '#3c7cee' : '#ee5a24';
+    }
+    return '#888';
+  }
+
+  update() {
+    this.x  += this.vx;   this.y  += this.vy;
+    this.vx *= FRICTION;  this.vy *= FRICTION;
+    if (Math.abs(this.vx) < VSTOP) this.vx = 0;
+    if (Math.abs(this.vy) < VSTOP) this.vy = 0;
+  }
+
+  get moving() { return this.vx !== 0 || this.vy !== 0; }
+
+  bounce() {
+    // Near a pocket corner → don't bounce, let it fall in
+    if (POCKETS.some(([px,py]) => hyp(this.x,this.y,px,py) < PKR + this.r)) return;
+    if (this.x-this.r < PL) { this.x = PL+this.r;  this.vx =  Math.abs(this.vx)*0.85; }
+    if (this.x+this.r > PR) { this.x = PR-this.r;  this.vx = -Math.abs(this.vx)*0.85; }
+    if (this.y-this.r < PT) { this.y = PT+this.r;  this.vy =  Math.abs(this.vy)*0.85; }
+    if (this.y+this.r > PB) { this.y = PB-this.r;  this.vy = -Math.abs(this.vy)*0.85; }
+  }
+
+  inPocket() {
+    return POCKETS.some(([px,py]) => hyp(this.x,this.y,px,py) < PKR);
+  }
+
+  draw() {
+    const {x,y,r} = this;
+    const col = this.hex;
+
+    // Shadow
+    ctx.beginPath(); ctx.arc(x+2,y+2,r,0,Math.PI*2);
+    ctx.fillStyle = 'rgba(0,0,0,0.40)'; ctx.fill();
+
+    // Body gradient
+    const g = ctx.createRadialGradient(x-r*0.3, y-r*0.3, r*0.1, x, y, r);
+    g.addColorStop(0, lighten(col, 55));
+    g.addColorStop(1, col);
+    ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2);
+    ctx.fillStyle = g; ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.65)'; ctx.lineWidth = 1; ctx.stroke();
+
+    // Striker ring
+    if (this.kind === 'striker') {
+      ctx.beginPath(); ctx.arc(x,y,r-5,0,Math.PI*2);
+      ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 2; ctx.stroke();
+      ctx.beginPath(); ctx.arc(x,y,3,0,Math.PI*2);
+      ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.fill();
+    }
+
+    // Queen gold centre
+    if (this.kind === 'red') {
+      const qg = ctx.createRadialGradient(x-2,y-2,1,x,y,r/2);
+      qg.addColorStop(0, '#ffe066');
+      qg.addColorStop(1, '#e09010');
+      ctx.beginPath(); ctx.arc(x,y,r/2,0,Math.PI*2);
+      ctx.fillStyle = qg; ctx.fill();
+    }
+  }
+}
+
+// ── Circle-circle elastic collision ──────────────────────────────────────────
+function collide(a, b) {
+  const dx = b.x-a.x, dy = b.y-a.y;
+  const d  = Math.hypot(dx,dy);
+  const md = a.r+b.r;
+  if (d < md && d > 1e-6) {
+    const nx = dx/d, ny = dy/d;
+    const dv = (a.vx-b.vx)*nx + (a.vy-b.vy)*ny;
+    if (dv > 0) {
+      a.vx -= dv*nx; a.vy -= dv*ny;
+      b.vx += dv*nx; b.vy += dv*ny;
+    }
+    const ov = (md-d)/2;
+    a.x -= nx*ov; a.y -= ny*ov;
+    b.x += nx*ov; b.y += ny*ov;
+  }
+}
+
+// ── Board renderer ────────────────────────────────────────────────────────────
+function drawBoard() {
+  // Canvas background
+  ctx.fillStyle = '#100602';
+  ctx.fillRect(0, 0, WIN_W, WIN_H);
+
+  // Board outer border (with gradient for depth)
+  const bg = ctx.createLinearGradient(BL,BT,BR,BB);
+  bg.addColorStop(0,   '#6e3e1a');
+  bg.addColorStop(0.5, '#4e2a0e');
+  bg.addColorStop(1,   '#3a2008');
+  ctx.fillStyle = bg;
+  ctx.fillRect(BL, BT, BSIZE, BSIZE);
+
+  // Inner border inset lines
+  ctx.strokeStyle = '#7a4520'; ctx.lineWidth = 2;
+  ctx.strokeRect(BL+4, BT+4, BSIZE-8, BSIZE-8);
+
+  // Playing surface
+  const sg = ctx.createLinearGradient(PL,PT,PR,PB);
+  sg.addColorStop(0,   '#d4ae6a');
+  sg.addColorStop(0.4, '#c4a05a');
+  sg.addColorStop(0.7, '#b89050');
+  sg.addColorStop(1,   '#c6a560');
+  ctx.fillStyle = sg;
+  ctx.fillRect(PL, PT, PR-PL, PB-PT);
+
+  // Subtle wood-grain lines
+  ctx.strokeStyle = 'rgba(160,115,40,0.25)'; ctx.lineWidth = 1;
+  for (let i=0; i<20; i++) {
+    const yy = PT + (PB-PT)/20*i;
+    ctx.beginPath(); ctx.moveTo(PL,yy); ctx.lineTo(PR,yy); ctx.stroke();
+  }
+
+  const lc = '#7e5818';
+
+  // Corner diagonal lines
+  const d = 85;
+  [[PL,PT,1,1],[PR,PT,-1,1],[PL,PB,1,-1],[PR,PB,-1,-1]].forEach(([cx,cy,sx,sy]) => {
+    ctx.strokeStyle = lc; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(cx,cy); ctx.lineTo(cx+sx*d, cy+sy*d); ctx.stroke();
+  });
+
+  // Centre circles
+  ctx.strokeStyle = lc; ctx.lineWidth = 2;
+  [85, 22].forEach(r => {
+    ctx.beginPath(); ctx.arc(CX,CY,r,0,Math.PI*2); ctx.stroke();
+  });
+  ctx.fillStyle = lc;
+  ctx.beginPath(); ctx.arc(CX,CY,4,0,Math.PI*2); ctx.fill();
+
+  // Baseline lines
+  [BLY1, BLY2].forEach(bly => {
+    ctx.strokeStyle = lc; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(BLX1,bly); ctx.lineTo(BLX2,bly); ctx.stroke();
+    [BLX1, BLX2].forEach(bx => {
+      ctx.beginPath(); ctx.arc(bx,bly,5,0,Math.PI*2); ctx.stroke();
+    });
+  });
+
+  // Baseline labels on board
+  ctx.fillStyle = 'rgba(100,65,15,0.85)';
+  ctx.font = '14px Arial'; ctx.textAlign = 'center';
+  ctx.fillText('← P2 baseline →', CX, BLY2+20);
+  ctx.fillText('← P1 baseline →', CX, BLY1-10);
+
+  // Pocket holes at corners
+  POCKETS.forEach(([px,py]) => {
+    // Pocket shadow ring
+    ctx.beginPath(); ctx.arc(px,py,PKR+4,0,Math.PI*2);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fill();
+    // Pocket hole
+    ctx.beginPath(); ctx.arc(px,py,PKR,0,Math.PI*2);
+    ctx.fillStyle = '#060402'; ctx.fill();
+    // Pocket rim
+    ctx.strokeStyle = '#2a1a08'; ctx.lineWidth = 4;
+    ctx.stroke();
+    // Inner glint
+    ctx.beginPath(); ctx.arc(px,py,PKR,0,Math.PI*2);
+    ctx.strokeStyle = 'rgba(100,70,20,0.4)'; ctx.lineWidth = 2;
+    ctx.stroke();
+  });
+}
+
+// ── Initial piece arrangement ─────────────────────────────────────────────────
+function makePieces() {
+  const ps = [new Piece(CX, CY, 'red')];  // Queen at centre
+  // Inner ring: 6 pieces alternating W/B
+  const r1 = PCR * 2.40;
+  for (let i = 0; i < 6; i++) {
+    const a = Math.PI/6 + i * Math.PI/3;
+    ps.push(new Piece(CX+r1*Math.cos(a), CY+r1*Math.sin(a), i%2===0?'white':'black'));
+  }
+  // Outer ring: 12 pieces alternating W/B
+  const r2 = PCR * 4.75;
+  for (let i = 0; i < 12; i++) {
+    const a = i * Math.PI/6;
+    ps.push(new Piece(CX+r2*Math.cos(a), CY+r2*Math.sin(a), i%2===0?'white':'black'));
+  }
+  return ps;  // 1 red + 9 white + 9 black = 19
+}
+
+// ── Game class ────────────────────────────────────────────────────────────────
+class Game {
+  constructor() { this.reset(); }
+
+  reset() {
+    this.pieces      = makePieces();
+    this.turn        = 1;
+    this.striker     = new Piece(CX, BLY1, 'striker', 1);
+    this.state       = AIMING;
+    this.score       = {1:0, 2:0};
+    this.dragging    = false;
+    this.dragPt      = null;
+    this.mouseX      = CX;
+    this.mouseY      = WIN_H/2;
+    this.pocketedT   = [];    // pieces pocketed this shot
+    this.strikerFell = false;
+    this.queenPend   = false;
+    this.msg         = '';
+    this.msgT        = 0;
+    this.winner      = null;
+  }
+
+  get baseY() { return this.turn === 1 ? BLY1 : BLY2; }
+
+  setMsg(m, t=180) { this.msg = m; this.msgT = t; }
+
+  allStopped() {
+    if (this.striker.alive && this.striker.moving) return false;
+    return this.pieces.every(p => !p.alive || !p.moving);
+  }
+
+  // ── Input ──────────────────────────────────────────────────────────────────
+  onDown(mx, my) {
+    if (this.state === GAME_OVER) { this.reset(); return; }
+    if (this.state !== AIMING) return;
+    const s = this.striker;
+    if (hyp(mx,my,s.x,s.y) < s.r + 16) {
+      this.dragging = true;
+      this.dragPt   = {x:mx, y:my};
+    }
+  }
+
+  onMove(mx, my) {
+    this.mouseX = mx; this.mouseY = my;
+    if (this.state === AIMING && !this.dragging) {
+      this.striker.x = Math.max(BLX1, Math.min(BLX2, mx));
+      this.striker.y = this.baseY;
+    }
+  }
+
+  onUp(mx, my) {
+    if (!this.dragging) return;
+    const dx = this.dragPt.x - mx;
+    const dy = this.dragPt.y - my;
+    const d  = Math.hypot(dx, dy);
+    if (d > 8) {
+      const spd = Math.min(d, MAX_DRAG) / MAX_DRAG * MAX_SPD;
+      this.striker.vx   = dx/d * spd;
+      this.striker.vy   = dy/d * spd;
+      this.state        = MOVING;
+      this.pocketedT    = [];
+      this.strikerFell  = false;
+    }
+    this.dragging = false;
+    this.dragPt   = null;
+  }
+
+  // ── Physics update ─────────────────────────────────────────────────────────
+  update() {
+    if (this.msgT > 0) this.msgT--;
+    if (this.state !== MOVING) return;
+
+    const alive = this.pieces.filter(p => p.alive);
+    const phys  = alive.concat(this.striker.alive ? [this.striker] : []);
+
+    // 1. Move all
+    phys.forEach(p => p.update());
+
+    // 2. Pocket detection (before wall bounce so corner pieces fall in cleanly)
+    alive.forEach(p => {
+      if (p.inPocket()) {
+        p.alive = false;
+        this.pocketedT.push(p);
+        if (p.kind === 'red') {
+          this.queenPend = true;
+        } else if (p.kind === (this.turn===1 ? 'white' : 'black')) {
+          this.score[this.turn]++;
+        }
+      }
+    });
+
+    if (this.striker.alive && this.striker.inPocket()) {
+      this.striker.alive  = false;
+      this.strikerFell    = true;
+      this.score[this.turn] = Math.max(0, this.score[this.turn] - 1);
+      this.setMsg(`P${this.turn}: Striker pocketed! −1 point`);
+    }
+
+    // 3. Wall bounce
+    this.pieces.filter(p => p.alive).forEach(p => p.bounce());
+    if (this.striker.alive) this.striker.bounce();
+
+    // 4. Piece-piece collisions (3 passes for stability)
+    const all = this.pieces.filter(p=>p.alive).concat(this.striker.alive?[this.striker]:[]);
+    for (let pass=0; pass<3; pass++) {
+      for (let i=0; i<all.length; i++)
+        for (let j=i+1; j<all.length; j++)
+          collide(all[i], all[j]);
+    }
+
+    if (this.allStopped()) this.endTurn();
+  }
+
+  // ── End-of-turn resolution ─────────────────────────────────────────────────
+  endTurn() {
+    const own        = this.turn===1 ? 'white' : 'black';
+    const ownPocketed = this.pocketedT.some(p => p.kind === own);
+
+    // Queen rule
+    if (this.queenPend) {
+      if (ownPocketed) {
+        this.score[this.turn] += 3;
+        this.setMsg(`P${this.turn}: Queen covered! +3 bonus ♛`);
+      } else {
+        this.pieces.push(new Piece(CX, CY, 'red'));
+        this.setMsg('Queen not covered — returned to centre! ♛');
+      }
+      this.queenPend = false;
+    }
+
+    // Win condition
+    const wLeft = this.pieces.filter(p=>p.kind==='white'&&p.alive).length;
+    const bLeft = this.pieces.filter(p=>p.kind==='black'&&p.alive).length;
+    if (wLeft === 0) { this.winner=1; this.state=GAME_OVER; return; }
+    if (bLeft === 0) { this.winner=2; this.state=GAME_OVER; return; }
+
+    // Extra turn: pocketed own piece AND striker didn't fall
+    if (!(ownPocketed && !this.strikerFell))
+      this.turn = this.turn===1 ? 2 : 1;
+
+    // Reset striker to new turn's baseline
+    this.striker.alive = true;
+    this.striker.vx    = this.striker.vy = 0;
+    this.striker.owner = this.turn;
+    this.striker.x     = CX;
+    this.striker.y     = this.baseY;
+    this.state = AIMING;
+  }
+
+  // ── Render ─────────────────────────────────────────────────────────────────
+  draw() {
+    drawBoard();
+
+    this.pieces.forEach(p => { if (p.alive) p.draw(); });
+    if (this.striker.alive) this.striker.draw();
+
+    // Drag / aim indicator
+    if (this.dragging && this.dragPt) {
+      const {x:mx, y:my} = {x:this.mouseX, y:this.mouseY};
+      const sx = this.striker.x, sy = this.striker.y;
+      const dp = this.dragPt;
+
+      // Rubber-band lines
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,235,50,0.7)';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6,4]);
+      ctx.beginPath(); ctx.moveTo(sx,sy); ctx.lineTo(dp.x,dp.y); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(dp.x,dp.y); ctx.lineTo(mx,my); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.restore();
+
+      // Direction arrow from striker
+      const dx = dp.x - mx, dy = dp.y - my;
+      const d  = Math.hypot(dx, dy);
+      if (d > 6) {
+        const frac  = Math.min(d, MAX_DRAG) / MAX_DRAG;
+        const rc    = Math.floor(frac * 255);
+        const gc    = Math.floor((1-frac) * 200);
+        const aCol  = `rgb(${rc},${gc},30)`;
+        const nx=dx/d, ny=dy/d;
+
+        ctx.save();
+        ctx.strokeStyle = aCol; ctx.lineWidth = 3;
+        ctx.shadowColor = aCol; ctx.shadowBlur = 6;
+        ctx.beginPath(); ctx.moveTo(sx,sy); ctx.lineTo(sx+nx*115, sy+ny*115); ctx.stroke();
+        // Arrowhead
+        const ax = sx+nx*115, ay = sy+ny*115;
+        const px1 = ax - nx*14 + ny*8,  py1 = ay - ny*14 - nx*8;
+        const px2 = ax - nx*14 - ny*8,  py2 = ay - ny*14 + nx*8;
+        ctx.beginPath(); ctx.moveTo(ax,ay); ctx.lineTo(px1,py1); ctx.lineTo(px2,py2); ctx.closePath();
+        ctx.fillStyle = aCol; ctx.fill();
+        ctx.restore();
+
+        // Power label near mouse
+        ctx.font = 'bold 15px Arial';
+        ctx.fillStyle = aCol;
+        ctx.textAlign = 'left';
+        ctx.fillText(`Power ${Math.floor(frac*100)}%`, mx+14, my-6);
+      }
+
+      // Drag point dot
+      ctx.beginPath(); ctx.arc(dp.x,dp.y,4,0,Math.PI*2);
+      ctx.fillStyle = 'rgba(255,235,50,0.8)'; ctx.fill();
+    }
+
+    this.drawHUD();
+  }
+
+  drawHUD() {
+    const wL  = this.pieces.filter(p=>p.kind==='white'&&p.alive).length;
+    const bL  = this.pieces.filter(p=>p.kind==='black'&&p.alive).length;
+    const qOn = this.pieces.some(p=>p.kind==='red'&&p.alive);
+    const qStr = qOn ? '   ♛ Queen: on board' : '   ♛ Queen: pocketed';
+
+    // ── P2 banner (top) ───────────────────────────────────────────────────────
+    const a2 = this.turn===2 && this.state===AIMING;
+    rrect(ctx, BL, 8, BSIZE, 78, 10);
+    ctx.fillStyle = a2 ? '#c4471a' : '#1e1006';
+    ctx.fill();
+    if (a2) {
+      ctx.save();
+      ctx.clip(); // subtle glow edge
+      ctx.strokeStyle = 'rgba(255,140,60,0.4)'; ctx.lineWidth = 3;
+      rrect(ctx, BL, 8, BSIZE, 78, 10); ctx.stroke();
+      ctx.restore();
+    }
+    ctx.fillStyle = '#e4cda0'; ctx.font = 'bold 21px Arial'; ctx.textAlign = 'left';
+    ctx.fillText(`Player 2  ●  (Black)    Score: ${this.score[2]}    Pieces left: ${bL}${qStr}`, BL+16, 34);
+    if (a2) {
+      ctx.fillStyle = '#ffff90'; ctx.font = '15px Arial';
+      ctx.fillText('▶ YOUR TURN — slide mouse to position striker on baseline · click & drag it back · release to shoot', BL+16, 56);
+    } else {
+      ctx.fillStyle = 'rgba(200,170,100,0.45)'; ctx.font = '14px Arial';
+      ctx.fillText('Waiting…', BL+16, 56);
+    }
+
+    // ── P1 banner (bottom) ────────────────────────────────────────────────────
+    const a1 = this.turn===1 && this.state===AIMING;
+    rrect(ctx, BL, WIN_H-90, BSIZE, 78, 10);
+    ctx.fillStyle = a1 ? '#1a4ec2' : '#1e1006';
+    ctx.fill();
+    if (a1) {
+      ctx.save();
+      ctx.clip();
+      ctx.strokeStyle = 'rgba(100,160,255,0.4)'; ctx.lineWidth = 3;
+      rrect(ctx, BL, WIN_H-90, BSIZE, 78, 10); ctx.stroke();
+      ctx.restore();
+    }
+    ctx.fillStyle = '#e4cda0'; ctx.font = 'bold 21px Arial'; ctx.textAlign = 'left';
+    ctx.fillText(`Player 1  ○  (White)    Score: ${this.score[1]}    Pieces left: ${wL}${qStr}`, BL+16, WIN_H-66);
+    if (a1) {
+      ctx.fillStyle = '#ffff90'; ctx.font = '15px Arial';
+      ctx.fillText('▶ YOUR TURN — slide mouse to position striker on baseline · click & drag it back · release to shoot', BL+16, WIN_H-44);
+    } else {
+      ctx.fillStyle = 'rgba(200,170,100,0.45)'; ctx.font = '14px Arial';
+      ctx.fillText('Waiting…', BL+16, WIN_H-44);
+    }
+
+    // ── Footer ────────────────────────────────────────────────────────────────
+    ctx.font = '13px Arial'; ctx.fillStyle = 'rgba(150,115,60,0.7)'; ctx.textAlign = 'left';
+    ctx.fillText('R: restart  •  Player 1 (White) shoots from bottom  •  Player 2 (Black) shoots from top', BL, WIN_H-10);
+
+    // ── Floating message ──────────────────────────────────────────────────────
+    if (this.msg && this.msgT > 0) {
+      const alpha = Math.min(1, this.msgT / 90);
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.textAlign = 'center';
+      ctx.font = 'bold 22px Arial';
+      // Text shadow
+      ctx.fillStyle = 'rgba(0,0,0,0.7)';
+      ctx.fillText(this.msg, WIN_W/2+2, WIN_H/2 - 40+2);
+      ctx.fillStyle = '#ffe050';
+      ctx.fillText(this.msg, WIN_W/2, WIN_H/2 - 40);
+      ctx.restore();
+    }
+
+    // ── Game-over overlay ─────────────────────────────────────────────────────
+    if (this.state === GAME_OVER) {
+      ctx.fillStyle = 'rgba(0,0,0,0.70)';
+      ctx.fillRect(0, 0, WIN_W, WIN_H);
+
+      ctx.textAlign = 'center';
+
+      // Trophy glow
+      const cx = WIN_W/2, cy = WIN_H/2 - 80;
+      const glow = ctx.createRadialGradient(cx,cy,10,cx,cy,160);
+      glow.addColorStop(0,   'rgba(255,210,20,0.25)');
+      glow.addColorStop(1,   'rgba(255,210,20,0)');
+      ctx.fillStyle = glow;
+      ctx.fillRect(cx-170, cy-90, 340, 280);
+
+      ctx.font = 'bold 68px Arial'; ctx.fillStyle = '#ffe640';
+      ctx.shadowColor = '#ff9000'; ctx.shadowBlur = 20;
+      ctx.fillText(`Player ${this.winner} Wins!`, WIN_W/2, WIN_H/2 - 85);
+      ctx.shadowBlur = 0;
+
+      ctx.font = 'bold 28px Arial'; ctx.fillStyle = '#e4cda0';
+      ctx.fillText(`P1: ${this.score[1]} pts   |   P2: ${this.score[2]} pts`, WIN_W/2, WIN_H/2 - 12);
+
+      rrect(ctx, WIN_W/2 - 140, WIN_H/2 + 28, 280, 50, 10);
+      ctx.fillStyle = '#3c7cee'; ctx.fill();
+      ctx.font = 'bold 22px Arial'; ctx.fillStyle = '#fff';
+      ctx.fillText('Click or press R to play again', WIN_W/2, WIN_H/2 + 59);
+    }
+  }
+}
+
+// ── Wiring ────────────────────────────────────────────────────────────────────
+const game = new Game();
+
+function canvasXY(e) {
+  const r = canvas.getBoundingClientRect();
+  const sx = WIN_W / r.width, sy = WIN_H / r.height;
+  const src = e.touches ? e.touches[0] : e;
+  return [(src.clientX - r.left)*sx, (src.clientY - r.top)*sy];
+}
+
+canvas.addEventListener('mousedown',  e => { const [x,y]=canvasXY(e); game.onDown(x,y); });
+canvas.addEventListener('mousemove',  e => { const [x,y]=canvasXY(e); game.onMove(x,y); });
+canvas.addEventListener('mouseup',    e => { const [x,y]=canvasXY(e); game.onUp(x,y); });
+window.addEventListener('mouseup',    e => { if(game.dragging){ const [x,y]=canvasXY(e); game.onUp(x,y); } });
+
+canvas.addEventListener('touchstart', e => { e.preventDefault(); const [x,y]=canvasXY(e); game.onDown(x,y); }, {passive:false});
+canvas.addEventListener('touchmove',  e => { e.preventDefault(); const [x,y]=canvasXY(e); game.onMove(x,y); }, {passive:false});
+canvas.addEventListener('touchend',   e => {
+  e.preventDefault();
+  if (e.changedTouches.length) {
+    const r = canvas.getBoundingClientRect();
+    const sx=WIN_W/r.width, sy=WIN_H/r.height;
+    const t = e.changedTouches[0];
+    game.onUp((t.clientX-r.left)*sx, (t.clientY-r.top)*sy);
+  }
+}, {passive:false});
+
+document.addEventListener('keydown', e => {
+  if (e.key==='r'||e.key==='R') game.reset();
+});
+
+// Responsive scaling
+function resize() {
+  const scale = Math.min(window.innerWidth/WIN_W, window.innerHeight/WIN_H);
+  canvas.style.width  = WIN_W*scale + 'px';
+  canvas.style.height = WIN_H*scale + 'px';
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ── Game loop ─────────────────────────────────────────────────────────────────
+function loop() {
+  game.update();
+  game.draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
